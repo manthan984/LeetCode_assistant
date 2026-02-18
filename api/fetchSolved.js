@@ -17,10 +17,46 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Username is required' });
   }
 
+  try {
+    const recentSolved = await fetchRecentAcceptedSubmissions(username);
+
+    let allSolvedSlugs = [];
+    let source = 'recent';
+
+    try {
+      allSolvedSlugs = await fetchAllAcceptedSlugs(username);
+      if (allSolvedSlugs.length) {
+        source = 'full';
+      }
+    } catch (error) {
+      console.error('Full history fetch failed, falling back to recent list:', error?.message);
+      allSolvedSlugs = [];
+    }
+
+    if (!allSolvedSlugs.length) {
+      allSolvedSlugs = dedupeSlugs(recentSolved.map(item => item.titleSlug));
+    }
+
+    return res.status(200).json({
+      source,
+      recentSolved,
+      allSolvedSlugs,
+      counts: {
+        recentSolved: recentSolved.length,
+        allSolved: allSolvedSlugs.length
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Server error", details: err.message });
+  }
+}
+
+async function fetchRecentAcceptedSubmissions(username) {
   const query = {
     query: `
-      query recentSolved($username: String!) {
-        recentSubmissionList(username: $username) {
+      query recentAccepted($username: String!) {
+        recentAcSubmissionList(username: $username) {
           title
           titleSlug
           timestamp
@@ -30,19 +66,100 @@ export default async function handler(req, res) {
     variables: { username }
   };
 
-  try {
-    const response = await fetch("https://leetcode.com/graphql", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(query)
+  const data = await graphqlRequest(query);
+  const list = Array.isArray(data?.recentAcSubmissionList) ? data.recentAcSubmissionList : [];
+
+  const dedupedBySlug = new Map();
+  list.forEach(item => {
+    if (!item?.titleSlug) return;
+
+    const slug = String(item.titleSlug).trim();
+    if (!slug) return;
+
+    const timestamp = Number(item.timestamp || 0);
+    const existing = dedupedBySlug.get(slug);
+
+    if (!existing || timestamp > Number(existing.timestamp || 0)) {
+      dedupedBySlug.set(slug, {
+        title: item.title || slug,
+        titleSlug: slug,
+        timestamp
+      });
+    }
+  });
+
+  return Array.from(dedupedBySlug.values()).sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+}
+
+async function fetchAllAcceptedSlugs(username) {
+  const accepted = new Set();
+  const pageSize = 20;
+  const maxPages = 500;
+
+  let offset = 0;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const query = {
+      query: `
+        query submissionList($offset: Int!, $limit: Int!, $username: String!) {
+          submissionList(offset: $offset, limit: $limit, username: $username) {
+            hasNext
+            submissions {
+              titleSlug
+              statusDisplay
+            }
+          }
+        }
+      `,
+      variables: {
+        offset,
+        limit: pageSize,
+        username
+      }
+    };
+
+    const data = await graphqlRequest(query);
+    const submissionList = data?.submissionList;
+    const submissions = Array.isArray(submissionList?.submissions) ? submissionList.submissions : [];
+
+    submissions.forEach(submission => {
+      if (!submission?.titleSlug) return;
+      if (submission.statusDisplay !== 'Accepted') return;
+      accepted.add(String(submission.titleSlug).trim());
     });
 
-    const data = await response.json();
-    return res.status(200).json(data.data.recentSubmissionList);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Server error", details: err.message });
+    if (!submissionList?.hasNext || submissions.length === 0) {
+      break;
+    }
+
+    offset += pageSize;
   }
+
+  return Array.from(accepted).filter(Boolean);
+}
+
+async function graphqlRequest(payload) {
+  const response = await fetch('https://leetcode.com/graphql', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const json = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`LeetCode GraphQL request failed (${response.status})`);
+  }
+
+  if (json?.errors?.length) {
+    throw new Error(json.errors[0]?.message || 'LeetCode GraphQL returned errors');
+  }
+
+  return json?.data || {};
+}
+
+function dedupeSlugs(slugs) {
+  return Array.from(new Set((Array.isArray(slugs) ? slugs : []).map(slug => String(slug || '').trim()).filter(Boolean)));
 }
