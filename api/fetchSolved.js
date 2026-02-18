@@ -4,43 +4,51 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
-    return res.status(200).end(); // Preflight response for OPTIONS
+    return res.status(200).end();
   }
 
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Only POST allowed' });
   }
 
-  const { username } = req.body;
+  const { username, responseFormat, includeFullHistory } = req.body || {};
 
-  if (!username) {
+  if (!username || typeof username !== 'string' || !username.trim()) {
     return res.status(400).json({ error: 'Username is required' });
   }
 
+  const safeUsername = username.trim();
+  const wantsV2 = responseFormat === 'v2' || includeFullHistory === true;
+
   try {
-    const recentSolved = await fetchRecentAcceptedSubmissions(username);
+    const recentSolved = await fetchRecentSubmissions(safeUsername);
+
+    // Backward-compatible mode for old deployed frontend (expects raw array)
+    if (!wantsV2) {
+      return res.status(200).json(recentSolved);
+    }
 
     let allSolvedSlugs = [];
     let source = 'recent';
 
     try {
-      allSolvedSlugs = await fetchAllAcceptedSlugs(username);
+      allSolvedSlugs = await fetchAllAcceptedSlugsFromGraphQL(safeUsername);
       if (allSolvedSlugs.length) {
         source = 'full';
       }
     } catch (error) {
-      console.error('Full history fetch failed, falling back to recent list:', error?.message);
+      console.error('GraphQL full-history fetch failed:', error?.message);
       allSolvedSlugs = [];
     }
 
     if (!allSolvedSlugs.length) {
       try {
-        allSolvedSlugs = await fetchAllAcceptedSlugsFromPublicApi(username);
+        allSolvedSlugs = await fetchAllAcceptedSlugsFromPublicApi(safeUsername);
         if (allSolvedSlugs.length) {
           source = 'full';
         }
       } catch (error) {
-        console.error('Public submissions API full-history fetch failed:', error?.message);
+        console.error('Public API full-history fetch failed:', error?.message);
         allSolvedSlugs = [];
       }
     }
@@ -60,15 +68,15 @@ export default async function handler(req, res) {
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Server error", details: err.message });
+    return res.status(500).json({ error: 'Server error', details: err.message });
   }
 }
 
-async function fetchRecentAcceptedSubmissions(username) {
+async function fetchRecentSubmissions(username) {
   const query = {
     query: `
-      query recentAccepted($username: String!) {
-        recentAcSubmissionList(username: $username) {
+      query recentSolved($username: String!) {
+        recentSubmissionList(username: $username) {
           title
           titleSlug
           timestamp
@@ -79,9 +87,9 @@ async function fetchRecentAcceptedSubmissions(username) {
   };
 
   const data = await graphqlRequest(query);
-  const list = Array.isArray(data?.recentAcSubmissionList) ? data.recentAcSubmissionList : [];
+  const list = Array.isArray(data?.recentSubmissionList) ? data.recentSubmissionList : [];
 
-  const dedupedBySlug = new Map();
+  const map = new Map();
   list.forEach(item => {
     if (!item?.titleSlug) return;
 
@@ -89,10 +97,10 @@ async function fetchRecentAcceptedSubmissions(username) {
     if (!slug) return;
 
     const timestamp = Number(item.timestamp || 0);
-    const existing = dedupedBySlug.get(slug);
+    const existing = map.get(slug);
 
     if (!existing || timestamp > Number(existing.timestamp || 0)) {
-      dedupedBySlug.set(slug, {
+      map.set(slug, {
         title: item.title || slug,
         titleSlug: slug,
         timestamp
@@ -100,14 +108,13 @@ async function fetchRecentAcceptedSubmissions(username) {
     }
   });
 
-  return Array.from(dedupedBySlug.values()).sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+  return Array.from(map.values()).sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
 }
 
-async function fetchAllAcceptedSlugs(username) {
+async function fetchAllAcceptedSlugsFromGraphQL(username) {
   const accepted = new Set();
   const pageSize = 20;
   const maxPages = 500;
-
   let offset = 0;
 
   for (let page = 0; page < maxPages; page += 1) {
@@ -154,15 +161,17 @@ async function fetchAllAcceptedSlugsFromPublicApi(username) {
   const accepted = new Set();
   const pageSize = 20;
   const maxPages = 500;
-
   let offset = 0;
 
   for (let page = 0; page < maxPages; page += 1) {
     const url = `https://leetcode.com/api/submissions/${encodeURIComponent(username)}/?offset=${offset}&limit=${pageSize}`;
+
     const response = await fetch(url, {
       method: 'GET',
       headers: {
-        'Content-Type': 'application/json'
+        'Accept': 'application/json, text/plain, */*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': 'https://leetcode.com/'
       }
     });
 
@@ -176,10 +185,7 @@ async function fetchAllAcceptedSlugsFromPublicApi(username) {
     submissions.forEach(submission => {
       if (!submission) return;
 
-      const slug = typeof submission.title_slug === 'string'
-        ? submission.title_slug.trim()
-        : '';
-
+      const slug = typeof submission.title_slug === 'string' ? submission.title_slug.trim() : '';
       if (!slug) return;
 
       const status = submission.status_display || submission.statusDisplay;
@@ -203,18 +209,27 @@ async function graphqlRequest(payload) {
   const response = await fetch('https://leetcode.com/graphql', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/plain, */*',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Referer': 'https://leetcode.com/'
     },
     body: JSON.stringify(payload)
   });
 
-  const json = await response.json();
+  const raw = await response.text();
+  let json;
+  try {
+    json = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error(`LeetCode GraphQL returned non-JSON response (${response.status})`);
+  }
 
   if (!response.ok) {
     throw new Error(`LeetCode GraphQL request failed (${response.status})`);
   }
 
-  if (json?.errors?.length) {
+  if (Array.isArray(json?.errors) && json.errors.length > 0) {
     throw new Error(json.errors[0]?.message || 'LeetCode GraphQL returned errors');
   }
 
@@ -222,5 +237,6 @@ async function graphqlRequest(payload) {
 }
 
 function dedupeSlugs(slugs) {
-  return Array.from(new Set((Array.isArray(slugs) ? slugs : []).map(slug => String(slug || '').trim()).filter(Boolean)));
+  const clean = Array.isArray(slugs) ? slugs : [];
+  return Array.from(new Set(clean.map(slug => String(slug || '').trim()).filter(Boolean)));
 }
