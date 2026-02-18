@@ -34,6 +34,18 @@ export default async function handler(req, res) {
     }
 
     if (!allSolvedSlugs.length) {
+      try {
+        allSolvedSlugs = await fetchAllAcceptedSlugsFromPublicApi(username);
+        if (allSolvedSlugs.length) {
+          source = 'full';
+        }
+      } catch (error) {
+        console.error('Public submissions API full-history fetch failed:', error?.message);
+        allSolvedSlugs = [];
+      }
+    }
+
+    if (!allSolvedSlugs.length) {
       allSolvedSlugs = dedupeSlugs(recentSolved.map(item => item.titleSlug));
     }
 
@@ -136,6 +148,55 @@ async function fetchAllAcceptedSlugs(username) {
   }
 
   return Array.from(accepted).filter(Boolean);
+}
+
+async function fetchAllAcceptedSlugsFromPublicApi(username) {
+  const accepted = new Set();
+  const pageSize = 20;
+  const maxPages = 500;
+
+  let offset = 0;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const url = `https://leetcode.com/api/submissions/${encodeURIComponent(username)}/?offset=${offset}&limit=${pageSize}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Public submissions API failed (${response.status})`);
+    }
+
+    const data = await response.json();
+    const submissions = Array.isArray(data?.submissions_dump) ? data.submissions_dump : [];
+
+    submissions.forEach(submission => {
+      if (!submission) return;
+
+      const slug = typeof submission.title_slug === 'string'
+        ? submission.title_slug.trim()
+        : '';
+
+      if (!slug) return;
+
+      const status = submission.status_display || submission.statusDisplay;
+      if (status !== 'Accepted') return;
+
+      accepted.add(slug);
+    });
+
+    const hasNext = Boolean(data?.has_next);
+    if (!hasNext || submissions.length === 0) {
+      break;
+    }
+
+    offset += pageSize;
+  }
+
+  return Array.from(accepted);
 }
 
 async function graphqlRequest(payload) {
